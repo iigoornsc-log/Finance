@@ -29,6 +29,25 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "finance_data.json")
 BACKUP_FILE = os.path.join(BASE_DIR, "finance_data_backup.json")
 
+# ============================================================
+# SUPABASE (persistencia em nuvem)
+# Se as variaveis de ambiente SUPABASE_URL e SUPABASE_KEY estiverem
+# definidas, os dados sao lidos/gravados no Postgres do Supabase
+# (tabela finance_data, coluna jsonb) em vez do arquivo .json local.
+# Isso resolve o problema de perda de dados ao hospedar em servicos
+# com disco efemero, como o Render.
+# ============================================================
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
+ROW_ID = "main"
+
+supabase = None
+if USE_SUPABASE:
+    from supabase import create_client
+
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 MESES_PT = [
     "Janeiro",
     "Fevereiro",
@@ -277,6 +296,7 @@ def default_data():
         "transacoes": [],
         "historico_snapshots": [],
         "alertas_lidos": [],
+        "checklist": [],
     }
 
 
@@ -317,10 +337,43 @@ def normalizar_dados_projecao(data):
     return data, alterado
 
 
+def _load_from_supabase():
+    res = supabase.table("finance_data").select("data").eq("id", ROW_ID).execute()
+    if res.data:
+        return res.data[0]["data"]
+    data = default_data()
+    supabase.table("finance_data").insert({"id": ROW_ID, "data": data}).execute()
+    return data
+
+
+def _save_to_supabase(data, backup=False):
+    if backup:
+        try:
+            current = (
+                supabase.table("finance_data")
+                .select("data")
+                .eq("id", ROW_ID)
+                .execute()
+            )
+            if current.data:
+                supabase.table("finance_data_backup").upsert(
+                    {"id": ROW_ID, "data": current.data[0]["data"]}
+                ).execute()
+        except Exception:
+            pass
+    supabase.table("finance_data").upsert(
+        {"id": ROW_ID, "data": data, "updated_at": datetime.utcnow().isoformat()}
+    ).execute()
+
+
 def load_data():
-    ensure_data_file()
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    if USE_SUPABASE:
+        data = _load_from_supabase()
+    else:
+        ensure_data_file()
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    data.setdefault("checklist", [])
     data, alterado = normalizar_dados_projecao(data)
     if alterado:
         save_data(data, backup=False)
@@ -328,6 +381,9 @@ def load_data():
 
 
 def save_data(data, backup=False):
+    if USE_SUPABASE:
+        _save_to_supabase(data, backup=backup)
+        return
     with _lock:
         if backup and os.path.exists(DATA_FILE):
             try:
@@ -1191,6 +1247,89 @@ def api_contas_pagar(conta_id):
 
 
 # ============================================================
+# ROTAS - CHECKLIST MENSAL DE PAGAMENTOS
+# ============================================================
+
+
+@app.route("/api/checklist", methods=["GET"])
+def api_checklist_listar():
+    mes = request.args.get("mes") or date.today().strftime("%Y-%m")
+    try:
+        ano, mes_num = int(mes[:4]), int(mes[5:7])
+    except Exception:
+        hoje = date.today()
+        ano, mes_num, mes = hoje.year, hoje.month, hoje.strftime("%Y-%m")
+
+    data = load_data()
+    contas = contas_do_mes(data, ano, mes_num)
+    checklist = data.get("checklist", [])
+
+    itens = []
+    total = 0.0
+    pago_total = 0.0
+    for c in sorted(contas, key=lambda x: (x.get("dia") or 0, (x.get("nome") or "").lower())):
+        item = next(
+            (i for i in checklist if i.get("mes") == mes and i.get("conta_id") == c["id"]),
+            None,
+        )
+        pago = bool(item and item.get("pago"))
+        valor = float(c.get("valor") or 0)
+        total += valor
+        if pago:
+            pago_total += valor
+        itens.append(
+            {
+                "conta_id": c["id"],
+                "nome": c.get("nome"),
+                "valor": round(valor, 2),
+                "dia": c.get("dia"),
+                "grupo": c.get("grupo"),
+                "categoria": c.get("categoria"),
+                "forma_pagamento": c.get("forma_pagamento"),
+                "pago": pago,
+                "pago_em": item.get("pago_em") if item else None,
+            }
+        )
+
+    return jsonify(
+        {
+            "mes": mes,
+            "itens": itens,
+            "total": round(total, 2),
+            "pago": round(pago_total, 2),
+            "restante": round(total - pago_total, 2),
+            "qtd_total": len(itens),
+            "qtd_pagas": sum(1 for i in itens if i["pago"]),
+        }
+    )
+
+
+@app.route("/api/checklist/<conta_id>/toggle", methods=["POST"])
+def api_checklist_toggle(conta_id):
+    body = request.get_json(force=True) or {}
+    mes = body.get("mes") or date.today().strftime("%Y-%m")
+    data = load_data()
+    checklist = data.setdefault("checklist", [])
+    item = next(
+        (i for i in checklist if i.get("mes") == mes and i.get("conta_id") == conta_id),
+        None,
+    )
+    if item:
+        item["pago"] = not item.get("pago")
+        item["pago_em"] = datetime.now().isoformat() if item["pago"] else None
+    else:
+        item = {
+            "mes": mes,
+            "conta_id": conta_id,
+            "pago": True,
+            "pago_em": datetime.now().isoformat(),
+        }
+        checklist.append(item)
+    save_data(data)
+    return jsonify(item)
+
+
+# ============================================================
 # ROTAS - CRUD: CARTOES
 # ============================================================
 
@@ -1586,11 +1725,20 @@ def api_export_csv():
 def api_backup():
     data = load_data()
     save_data(data, backup=True)
-    return jsonify({"ok": True, "arquivo": os.path.basename(BACKUP_FILE)})
+    destino = "Supabase (tabela finance_data_backup)" if USE_SUPABASE else os.path.basename(BACKUP_FILE)
+    return jsonify({"ok": True, "arquivo": destino})
 
 
 @app.route("/api/restore", methods=["POST"])
 def api_restore():
+    if USE_SUPABASE:
+        res = (
+            supabase.table("finance_data_backup").select("data").eq("id", ROW_ID).execute()
+        )
+        if not res.data:
+            return jsonify({"erro": "Nenhum backup encontrado"}), 404
+        save_data(res.data[0]["data"], backup=False)
+        return jsonify({"ok": True})
     if not os.path.exists(BACKUP_FILE):
         return jsonify({"erro": "Nenhum backup encontrado"}), 404
     with open(BACKUP_FILE, "r", encoding="utf-8") as f:
@@ -1803,6 +1951,69 @@ tr:last-child td{ border-bottom:none; }
 @media (max-width:480px){
   .grid-cards{ grid-template-columns:1fr 1fr; }
 }
+
+/* ---------- ANIMACOES / MICRO-INTERACOES ---------- */
+@keyframes viewFadeIn{ from{ opacity:0; transform:translateY(6px);} to{ opacity:1; transform:translateY(0);} }
+.view-enter{ animation:viewFadeIn .28s ease; }
+
+@keyframes popIn{ 0%{ transform:scale(.85); opacity:0;} 60%{ transform:scale(1.04);} 100%{ transform:scale(1); opacity:1;} }
+@keyframes checkDraw{ from{ stroke-dashoffset:20;} to{ stroke-dashoffset:0;} }
+@keyframes pulseGlow{ 0%,100%{ box-shadow:0 0 0 0 rgba(51,214,160,.35);} 50%{ box-shadow:0 0 0 6px rgba(51,214,160,0);} }
+@keyframes shimmer{ 0%{ background-position:-200px 0;} 100%{ background-position:200px 0;} }
+@keyframes floatUp{ 0%{ transform:translateY(0) scale(1); opacity:1;} 100%{ transform:translateY(-70px) scale(1.4); opacity:0;} }
+
+.card, .stat-card{ transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease; }
+.card:hover{ transform:translateY(-2px); border-color:#3a4258; }
+.nav-item{ transition:background .18s ease, color .18s ease, transform .12s ease; }
+.nav-item:active{ transform:scale(.97); }
+.nav-item.active{ position:relative; }
+.stat-value{ transition:color .2s ease; }
+.progress > div{ transition:width .5s cubic-bezier(.22,.9,.3,1); }
+.balance-bar div{ transition:width .5s ease; }
+
+/* checklist */
+.check-row{
+  display:flex; align-items:center; gap:12px; padding:13px 14px; border-radius:var(--radius-sm);
+  background:var(--surface-2); margin-bottom:8px; border:1px solid transparent; cursor:pointer;
+  transition:background .18s ease, border-color .18s ease, opacity .25s ease, transform .18s ease;
+}
+.check-row:hover{ border-color:var(--border); transform:translateX(2px); }
+.check-row.done{ opacity:.55; }
+.check-box{
+  width:26px; height:26px; min-width:26px; border-radius:8px; border:2px solid var(--muted);
+  display:flex; align-items:center; justify-content:center; background:var(--surface);
+  transition:background .18s ease, border-color .18s ease, transform .15s ease;
+}
+.check-row.done .check-box{ background:var(--green); border-color:var(--green); animation:popIn .3s ease; }
+.check-box svg{ width:15px; height:15px; stroke:#06120D; stroke-width:3; fill:none; stroke-linecap:round; stroke-linejoin:round;
+  stroke-dasharray:20; stroke-dashoffset:20; }
+.check-row.done .check-box svg{ animation:checkDraw .25s ease forwards .05s; }
+.check-row .name{ font-weight:600; font-size:13.5px; }
+.check-row.done .name{ text-decoration:line-through; text-decoration-color:var(--muted); }
+.check-row .meta{ font-size:11.5px; color:var(--muted); }
+.check-row .valor{ font-weight:700; font-family:var(--font-display); }
+
+.ring-wrap{ position:relative; width:112px; height:112px; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+.ring-wrap svg{ transform:rotate(-90deg); width:112px; height:112px; }
+.ring-wrap circle{ fill:none; stroke-width:10; }
+.ring-bg{ stroke:var(--surface-2); }
+.ring-fg{ stroke:var(--green); stroke-linecap:round; transition:stroke-dashoffset .6s cubic-bezier(.22,.9,.3,1); }
+.ring-label{ position:absolute; text-align:center; font-family:var(--font-display); }
+.ring-label b{ font-size:20px; display:block; }
+.ring-label span{ font-size:10.5px; color:var(--muted); }
+
+.confetti-pop{ position:fixed; left:50%; top:20%; transform:translateX(-50%); font-size:15px; font-weight:700;
+  background:var(--green); color:#06120D; padding:12px 22px; border-radius:999px; z-index:300; box-shadow:var(--shadow);
+  animation:floatUp 1.4s ease forwards; pointer-events:none; }
+
+.month-nav{ display:flex; align-items:center; gap:10px; }
+.month-nav .btn{ padding:7px 11px; }
+.month-nav .label{ font-weight:700; font-family:var(--font-display); min-width:130px; text-align:center; font-size:13.5px; }
+
+.filter-tabs{ display:flex; gap:6px; margin-bottom:14px; flex-wrap:wrap; }
+.filter-tabs button{ border:1px solid var(--border); background:var(--surface); color:var(--muted);
+  padding:7px 13px; border-radius:999px; font-size:12.5px; font-weight:600; transition:all .15s ease; }
+.filter-tabs button.active{ background:var(--blue); color:#08111F; border-color:transparent; }
 </style>
 </head>
 """
@@ -1846,6 +2057,7 @@ HTML_PAGE += r"""
 <script>
 const NAV = [
   {id:"dashboard", label:"Dashboard", ic:"&#128202;"},
+  {id:"checklist", label:"Checklist do mes", ic:"&#9989;"},
   {id:"contas", label:"Contas", ic:"&#128179;"},
   {id:"cartoes", label:"Cartoes", ic:"&#128180;"},
   {id:"emprestimos", label:"Emprestimos", ic:"&#127974;"},
@@ -1861,7 +2073,7 @@ const NAV = [
   {id:"historico", label:"Historico", ic:"&#128337;"},
   {id:"config", label:"Configuracoes", ic:"&#9881;"},
 ];
-const MOBILE_NAV_IDS = ["dashboard","contas","cartoes","parcelas","simulador","config"];
+const MOBILE_NAV_IDS = ["dashboard","checklist","contas","cartoes","simulador","config"];
 
 let STATE = { view:"dashboard", theme: localStorage.getItem("__nouse")||"dark" };
 let CATEGORIAS = ["Casa","Educacao","Assinaturas","Lazer","Parcelamento","Cartao","Pessoal","Financeiro","Outros"];
@@ -1939,6 +2151,10 @@ function setView(view){
   const found = NAV.find(n=>n.id===view);
   document.getElementById("page-title").textContent = found ? found.label : view;
   document.getElementById("top-actions").innerHTML = "";
+  const viewEl = document.getElementById("view");
+  viewEl.classList.remove("view-enter");
+  void viewEl.offsetWidth; /* reinicia a animacao a cada troca de aba */
+  viewEl.classList.add("view-enter");
   RENDERERS[view]();
 }
 
@@ -2057,6 +2273,129 @@ RENDERERS.dashboard = async function(){
     </div>
   `;
 };
+</script>
+"""
+
+HTML_PAGE += r"""
+<script>
+// ---------------- CHECKLIST DO MES ----------------
+STATE.checklistMes = STATE.checklistMes || (function(){
+  const d = new Date(); return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0");
+})();
+STATE.checklistFiltro = STATE.checklistFiltro || "todas";
+
+function mesLabel(mes){
+  const [ano, m] = mes.split("-").map(Number);
+  const nomes = ["Janeiro","Fevereiro","Marco","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
+  return nomes[m-1] + " / " + ano;
+}
+function somarMes(mes, delta){
+  const [ano, m] = mes.split("-").map(Number);
+  const d = new Date(ano, m-1+delta, 1);
+  return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0");
+}
+
+RENDERERS.checklist = async function(){
+  document.getElementById("page-sub").textContent = "Marque o que ja foi pago neste mes";
+  document.getElementById("top-actions").innerHTML = `
+    <div class="month-nav">
+      <button class="btn icon-btn" id="chk-prev">&#8592;</button>
+      <div class="label">${mesLabel(STATE.checklistMes)}</div>
+      <button class="btn icon-btn" id="chk-next">&#8594;</button>
+    </div>`;
+  document.getElementById("chk-prev").onclick = ()=>{ STATE.checklistMes = somarMes(STATE.checklistMes,-1); RENDERERS.checklist(); };
+  document.getElementById("chk-next").onclick = ()=>{ STATE.checklistMes = somarMes(STATE.checklistMes,1); RENDERERS.checklist(); };
+
+  const r = await api(`/api/checklist?mes=${STATE.checklistMes}`);
+  const pct = r.qtd_total ? Math.round((r.qtd_pagas / r.qtd_total) * 100) : 0;
+  const circunf = 2 * Math.PI * 46;
+  const offset = circunf - (pct/100) * circunf;
+
+  const filtros = [
+    {id:"todas", label:"Todas"},
+    {id:"pendentes", label:"Pendentes"},
+    {id:"pagas", label:"Pagas"},
+  ];
+
+  function linha(it){
+    return `<div class="check-row ${it.pago?'done':''}" data-id="${it.conta_id}">
+      <div class="check-box">
+        <svg viewBox="0 0 24 24"><polyline points="4,13 9,18 20,6"></polyline></svg>
+      </div>
+      <div class="left" style="flex:1; min-width:0;">
+        <div class="name">${it.nome}</div>
+        <div class="meta">Dia ${it.dia} - ${it.categoria} ${it.pago && it.pago_em ? ' - pago em ' + new Date(it.pago_em).toLocaleDateString('pt-BR') : ''}</div>
+      </div>
+      <div class="valor">${fmt(it.valor)}</div>
+    </div>`;
+  }
+
+  const itensFiltrados = r.itens.filter(it=>{
+    if(STATE.checklistFiltro==="pendentes") return !it.pago;
+    if(STATE.checklistFiltro==="pagas") return it.pago;
+    return true;
+  });
+
+  document.getElementById("view").innerHTML = `
+    <div class="grid grid-2">
+      <div class="card" style="display:flex; align-items:center; gap:22px;">
+        <div class="ring-wrap">
+          <svg viewBox="0 0 112 112">
+            <circle class="ring-bg" cx="56" cy="56" r="46"></circle>
+            <circle class="ring-fg" cx="56" cy="56" r="46" stroke-dasharray="${circunf}" stroke-dashoffset="${offset}"></circle>
+          </svg>
+          <div class="ring-label"><b id="chk-pct">${pct}%</b><span>concluido</span></div>
+        </div>
+        <div>
+          <div class="stat-label">Progresso do mes</div>
+          <div class="stat-value">${r.qtd_pagas} / ${r.qtd_total} contas pagas</div>
+          <div class="stat-sub">${fmt(r.pago)} pago de ${fmt(r.total)}</div>
+        </div>
+      </div>
+      <div class="card stat-card">
+        <div class="stat-label">Falta pagar</div>
+        <div class="stat-value neg">${fmt(r.restante)}</div>
+        <div class="progress"><div style="width:${pct}%"></div></div>
+        <div class="stat-sub">Atualizado automaticamente ao marcar cada conta</div>
+      </div>
+    </div>
+
+    <div class="section-title">Contas de ${mesLabel(STATE.checklistMes)}</div>
+    <div class="filter-tabs">
+      ${filtros.map(f=>`<button class="${STATE.checklistFiltro===f.id?'active':''}" data-f="${f.id}">${f.label}</button>`).join("")}
+    </div>
+    <div class="card" id="chk-list">
+      ${itensFiltrados.map(linha).join("") || '<div class="empty">Nenhuma conta nessa categoria</div>'}
+    </div>
+  `;
+
+  document.querySelectorAll(".filter-tabs button").forEach(b=>{
+    b.onclick = ()=>{ STATE.checklistFiltro = b.dataset.f; RENDERERS.checklist(); };
+  });
+
+  document.querySelectorAll(".check-row").forEach(row=>{
+    row.onclick = async ()=>{
+      const id = row.dataset.id;
+      const jaEstavaCompleto = r.qtd_total>0 && r.qtd_pagas===r.qtd_total;
+      try{
+        await api(`/api/checklist/${id}/toggle`, {method:"POST", body: JSON.stringify({mes: STATE.checklistMes})});
+        await RENDERERS.checklist();
+        const novo = await api(`/api/checklist?mes=${STATE.checklistMes}`);
+        if(novo.qtd_total>0 && novo.qtd_pagas===novo.qtd_total && !jaEstavaCompleto){
+          celebrarChecklist();
+        }
+      }catch(e){ toast("Erro ao atualizar checklist", "error"); }
+    };
+  });
+};
+
+function celebrarChecklist(){
+  const el = document.createElement("div");
+  el.className = "confetti-pop";
+  el.textContent = "\u{1F389} Mes 100% pago!";
+  document.body.appendChild(el);
+  setTimeout(()=>el.remove(), 1500);
+}
 </script>
 """
 
