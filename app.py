@@ -62,6 +62,10 @@ MESES_PT = [
     "Novembro",
     "Dezembro",
 ]
+MESES_ABREV = [
+    "jan", "fev", "mar", "abr", "mai", "jun",
+    "jul", "ago", "set", "out", "nov", "dez",
+]
 
 app = Flask(__name__)
 
@@ -910,6 +914,80 @@ def projecao_12_meses(data):
     return linhas
 
 
+def projecao_planilha(data, n_meses=12):
+    """Visao tipo planilha: uma linha por conta, uma coluna por mes."""
+    hoje = date.today()
+    ano0, mes0 = hoje.year, hoje.month
+    meses_idx = []
+    for i in range(n_meses):
+        m = (mes0 - 1 + i) % 12 + 1
+        a = ano0 + (mes0 - 1 + i) // 12
+        meses_idx.append((a, m))
+    labels = [f"{MESES_ABREV[m-1]}/{str(a)[2:]}" for a, m in meses_idx]
+
+    todas_contas = [c for c in data.get("contas", []) if conta_ativa(c)]
+
+    def linhas_grupo(grupo):
+        contas_grupo = [c for c in todas_contas if c.get("grupo") == grupo]
+        linhas = []
+        for c in sorted(contas_grupo, key=lambda x: (x.get("nome") or "").lower()):
+            valores = []
+            aparece = False
+            for (a, m) in meses_idx:
+                ativos = contas_do_mes(data, a, m, grupo)
+                ativo = next((x for x in ativos if x["id"] == c["id"]), None)
+                v = float(ativo["valor"]) if ativo else 0.0
+                if v:
+                    aparece = True
+                valores.append(round(v, 2))
+            if aparece:
+                linhas.append({"nome": c["nome"], "valores": valores})
+        return linhas
+
+    linhas05 = linhas_grupo("05")
+    linhas20 = linhas_grupo("20")
+
+    receita05, receita20 = [], []
+    cartoes_mes, contas05_mes, contas20_mes = [], [], []
+    for (a, m) in meses_idx:
+        r05, r20, _ = receita_do_mes(data, a, m)
+        c05, c20, _clt, cart = calcular_comprometido_mes(data, a, m)
+        receita05.append(round(r05, 2))
+        receita20.append(round(r20, 2))
+        cartoes_mes.append(round(cart, 2))
+        contas05_mes.append(round(c05, 2))
+        contas20_mes.append(round(c20, 2))
+
+    saldo05 = [round(receita05[i] - contas05_mes[i], 2) for i in range(n_meses)]
+    total20 = [round(contas20_mes[i] + cartoes_mes[i], 2) for i in range(n_meses)]
+    saldo20 = [round(receita20[i] - total20[i], 2) for i in range(n_meses)]
+    receita_total = [round(receita05[i] + receita20[i], 2) for i in range(n_meses)]
+    despesas_total = [round(contas05_mes[i] + total20[i], 2) for i in range(n_meses)]
+    sobra_mes = [round(receita_total[i] - despesas_total[i], 2) for i in range(n_meses)]
+
+    return {
+        "meses": labels,
+        "dia05": {
+            "receita": receita05,
+            "contas": linhas05,
+            "total_contas": contas05_mes,
+            "saldo": saldo05,
+        },
+        "dia20": {
+            "receita": receita20,
+            "contas": linhas20,
+            "cartoes": cartoes_mes,
+            "total_contas": total20,
+            "saldo": saldo20,
+        },
+        "consolidado": {
+            "receita_total": receita_total,
+            "despesas_total": despesas_total,
+            "sobra": sobra_mes,
+        },
+    }
+
+
 def quando_vou_me_livrar(data):
     hoje = date.today()
     itens = []
@@ -1036,6 +1114,14 @@ def api_alertas():
 def api_projecao():
     data = load_data()
     return jsonify(projecao_12_meses(data))
+
+
+@app.route("/api/fluxo-projetado")
+def api_fluxo_projetado():
+    data = load_data()
+    n = int(request.args.get("meses") or 12)
+    n = max(1, min(n, 24))
+    return jsonify(projecao_planilha(data, n))
 
 
 @app.route("/api/quando-vou-me-livrar")
@@ -2014,6 +2100,24 @@ tr:last-child td{ border-bottom:none; }
 .filter-tabs button{ border:1px solid var(--border); background:var(--surface); color:var(--muted);
   padding:7px 13px; border-radius:999px; font-size:12.5px; font-weight:600; transition:all .15s ease; }
 .filter-tabs button.active{ background:var(--blue); color:#08111F; border-color:transparent; }
+
+/* fluxo projetado (tabela estilo planilha) */
+.proj-table{ font-size:12.5px; }
+.proj-table th{ white-space:nowrap; text-align:right; }
+.proj-table th:first-child{ text-align:left; }
+.proj-table td{ text-align:right; white-space:nowrap; }
+.proj-table td:first-child{ text-align:left; white-space:normal; min-width:150px; }
+.proj-table .proj-section td{
+  background:var(--surface-2); font-weight:700; font-size:11.5px; text-transform:uppercase; letter-spacing:.03em;
+  color:var(--muted); padding-top:14px; padding-bottom:6px; border-bottom:1px solid var(--border);
+}
+.proj-table .proj-receita td{ color:var(--blue); font-weight:600; }
+.proj-table .proj-total td{ font-weight:700; border-top:1px solid var(--border); }
+.proj-table .proj-saldo td{ font-weight:700; }
+.proj-table .cell-pos{ background:rgba(51,214,160,.12); color:var(--green); }
+.proj-table .cell-neg{ background:rgba(255,107,107,.14); color:var(--red); }
+.proj-table .proj-consolidado td{ font-weight:700; font-size:13px; }
+.proj-table tr:hover td{ background-color:rgba(255,255,255,.03); }
 </style>
 </head>
 """
@@ -2062,7 +2166,7 @@ const NAV = [
   {id:"cartoes", label:"Cartoes", ic:"&#128180;"},
   {id:"emprestimos", label:"Emprestimos", ic:"&#127974;"},
   {id:"parcelas", label:"Parcelas", ic:"&#128203;"},
-  {id:"fluxo", label:"Fluxo de caixa", ic:"&#128200;"},
+  {id:"fluxo", label:"Fluxo projetado", ic:"&#128200;"},
   {id:"projecao", label:"Projecao 12m", ic:"&#128197;"},
   {id:"livrar", label:"Quando vou me livrar", ic:"&#127939;"},
   {id:"graficos", label:"Graficos", ic:"&#128201;"},
@@ -2728,66 +2832,66 @@ RENDERERS.parcelas = async function(){
   </div>`;
 };
 
-// ---------------- FLUXO DE CAIXA ----------------
+// ---------------- FLUXO PROJETADO (planilha mensal) ----------------
 RENDERERS.fluxo = async function(){
-  document.getElementById("page-sub").textContent = "Entradas e saidas registradas manualmente";
-  document.getElementById("top-actions").innerHTML = `<button class="btn btn-primary" id="btn-nova-tx">+ Novo lancamento</button>`;
-  document.getElementById("btn-nova-tx").onclick = ()=> abrirModalTx();
+  document.getElementById("page-sub").textContent = "Contas mes a mes, igual a sua planilha";
+  document.getElementById("top-actions").innerHTML = `
+    <div class="month-nav">
+      <button class="btn btn-sm" id="fx-6" data-n="6">6 meses</button>
+      <button class="btn btn-sm" id="fx-12" data-n="12">12 meses</button>
+      <button class="btn btn-sm" id="fx-24" data-n="24">24 meses</button>
+    </div>`;
+  STATE.fluxoMeses = STATE.fluxoMeses || 12;
+  ["fx-6","fx-12","fx-24"].forEach(id=>{
+    const el = document.getElementById(id);
+    if(Number(el.dataset.n) === STATE.fluxoMeses) el.classList.add("btn-primary");
+    el.onclick = ()=>{ STATE.fluxoMeses = Number(el.dataset.n); RENDERERS.fluxo(); };
+  });
 
-  const txs = await api("/api/transacoes");
-  let saldo = 0;
-  const linhas = [...txs].reverse().map(t=>{ saldo += (t.entrada||0)-(t.saida||0); return {...t, saldoAcumulado: saldo}; }).reverse();
+  const proj = await api(`/api/fluxo-projetado?meses=${STATE.fluxoMeses}`);
+  const meses = proj.meses;
+
+  function celula(v){
+    const cls = v > 0 ? "cell-pos" : (v < 0 ? "cell-neg" : "");
+    return `<td class="${cls}">${fmt(v)}</td>`;
+  }
+  function linhaConta(nome, valores){
+    return `<tr><td>${nome}</td>${valores.map(v=>`<td>${fmt(v)}</td>`).join("")}</tr>`;
+  }
+  function linhaSecao(titulo){
+    return `<tr class="proj-section"><td colspan="${meses.length+1}">${titulo}</td></tr>`;
+  }
+
+  const d05 = proj.dia05, d20 = proj.dia20, cons = proj.consolidado;
 
   document.getElementById("view").innerHTML = `
   <div class="card">
     <div class="table-wrap">
-    <table>
-      <thead><tr><th>Data</th><th>Descricao</th><th>Categoria</th><th>Entrada</th><th>Saida</th><th>Status</th><th></th></tr></thead>
+    <table class="proj-table">
+      <thead><tr><th>Item</th>${meses.map(m=>`<th>${m}</th>`).join("")}</tr></thead>
       <tbody>
-      ${linhas.map(t=>`<tr>
-        <td>${new Date(t.data+'T00:00:00').toLocaleDateString('pt-BR')}</td>
-        <td>${t.descricao}</td>
-        <td>${t.categoria}</td>
-        <td class="pos">${t.entrada?fmt(t.entrada):''}</td>
-        <td class="neg">${t.saida?fmt(t.saida):''}</td>
-        <td><span class="pill pill-blue">${t.status}</span></td>
-        <td><button class="icon-btn btn-sm" onclick="delTx('${t.id}')">&#128465;</button></td>
-      </tr>`).join("") || `<tr><td colspan="7" class="empty">Nenhum lancamento registrado</td></tr>`}
+        ${linhaSecao("Dia 05")}
+        <tr class="proj-receita"><td>Receita Dia 05 (salario)</td>${d05.receita.map(v=>`<td>${fmt(v)}</td>`).join("")}</tr>
+        ${d05.contas.map(c=>linhaConta(c.nome, c.valores)).join("")}
+        <tr class="proj-total"><td>Total contas Dia 05</td>${d05.total_contas.map(v=>`<td>${fmt(v)}</td>`).join("")}</tr>
+        <tr class="proj-saldo"><td>Saldo Dia 05</td>${d05.saldo.map(celula).join("")}</tr>
+
+        ${linhaSecao("Dia 20")}
+        <tr class="proj-receita"><td>Receita Dia 20 (vale)</td>${d20.receita.map(v=>`<td>${fmt(v)}</td>`).join("")}</tr>
+        ${d20.contas.map(c=>linhaConta(c.nome, c.valores)).join("")}
+        <tr><td>Cartoes</td>${d20.cartoes.map(v=>`<td>${fmt(v)}</td>`).join("")}</tr>
+        <tr class="proj-total"><td>Total contas Dia 20</td>${d20.total_contas.map(v=>`<td>${fmt(v)}</td>`).join("")}</tr>
+        <tr class="proj-saldo"><td>Saldo Dia 20</td>${d20.saldo.map(celula).join("")}</tr>
+
+        ${linhaSecao("Consolidado mensal")}
+        <tr class="proj-consolidado"><td>Receita total do mes</td>${cons.receita_total.map(v=>`<td>${fmt(v)}</td>`).join("")}</tr>
+        <tr class="proj-consolidado"><td>Despesas totais do mes</td>${cons.despesas_total.map(v=>`<td>${fmt(v)}</td>`).join("")}</tr>
+        <tr class="proj-consolidado proj-saldo"><td>Sobra / deficit do mes</td>${cons.sobra.map(celula).join("")}</tr>
       </tbody>
     </table>
     </div>
   </div>`;
 };
-
-function abrirModalTx(){
-  openModal(`
-    <h3>Novo lancamento</h3>
-    <div class="field"><label>Data</label><input id="f-data" type="date" value="${new Date().toISOString().slice(0,10)}"></div>
-    <div class="field"><label>Descricao</label><input id="f-desc" placeholder="Ex: Compra no mercado"></div>
-    <div class="field-row">
-      <div class="field"><label>Entrada (R$)</label><input id="f-entrada" type="number" step="0.01" value="0"></div>
-      <div class="field"><label>Saida (R$)</label><input id="f-saida" type="number" step="0.01" value="0"></div>
-    </div>
-    <div class="field"><label>Categoria</label><select id="f-cat">${CATEGORIAS.map(c=>`<option>${c}</option>`).join("")}</select></div>
-    <div class="modal-actions">
-      <button class="btn" onclick="closeModal()">Cancelar</button>
-      <button class="btn btn-primary" id="btn-salvar-tx">Salvar</button>
-    </div>
-  `);
-  document.getElementById("btn-salvar-tx").onclick = async ()=>{
-    const body = {
-      data: document.getElementById("f-data").value,
-      descricao: document.getElementById("f-desc").value || "Lancamento",
-      entrada: parseFloat(document.getElementById("f-entrada").value)||0,
-      saida: parseFloat(document.getElementById("f-saida").value)||0,
-      categoria: document.getElementById("f-cat").value,
-      status: "CONFIRMADO",
-    };
-    await api("/api/transacoes", {method:"POST", body: JSON.stringify(body)});
-    closeModal(); toast("Lancamento salvo"); RENDERERS.fluxo();
-  };
-}
-async function delTx(id){ await api(`/api/transacoes/${id}`, {method:"DELETE"}); toast("Removido"); RENDERERS.fluxo(); }
 
 // ---------------- PROJECAO 12 MESES ----------------
 RENDERERS.projecao = async function(){
