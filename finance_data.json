@@ -462,11 +462,31 @@
       "mes": "2026-08",
       "saldo_total": 1099.0,
       "dinheiro_livre": 240.0,
-      "dinheiro_comprometido": 2175.3,
+      "dinheiro_comprometido": 2275.3,
       "reserva": 0.0,
-      "parcelas_ativas": 7,
-      "sobra_mes": 924.7
+      "parcelas_ativas": 8,
+      "sobra_mes": 824.7
     }
   ],
-  "alertas_lidos": []
+  "alertas_lidos": [],
+  "checklist": [
+    {
+      "mes": "2026-08",
+      "conta_id": "4ccb3cd04b",
+      "pago": false,
+      "pago_em": null
+    },
+    {
+      "mes": "2026-08",
+      "conta_id": "4934ebe771",
+      "pago": false,
+      "pago_em": null
+    },
+    {
+      "mes": "2026-08",
+      "conta_id": "fe78afb2e5",
+      "pago": false,
+      "pago_em": null
+    }
+  ]
 }
